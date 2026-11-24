@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>水果礼盒报价助手</title>
+<style>
+  :root { --bg:#f7f5f0; --card:#fff; --ink:#2b2b2b; --muted:#777; --accent:#d9480f; --ok:#2f9e44; --warn:#e67700; --bad:#c92a2a; --line:#e9e4da; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; background:var(--bg); color:var(--ink); }
+  .banner { background:#fff3bf; color:#7a5a00; text-align:center; font-size:13px; padding:6px 16px; }
+  header { padding:20px 16px 8px; max-width:1100px; margin:0 auto; }
+  h1 { margin:0 0 4px; font-size:22px; }
+  .sub { color:var(--muted); font-size:13px; }
+  main { max-width:1100px; margin:0 auto; padding:0 16px 40px; }
+  .input { display:flex; gap:8px; margin:12px 0; }
+  textarea { flex:1; font:inherit; font-size:15px; padding:10px 12px; border:1px solid var(--line); border-radius:10px; resize:vertical; min-height:48px; }
+  button { font:inherit; cursor:pointer; border:0; border-radius:10px; }
+  .primary { background:var(--accent); color:#fff; padding:0 20px; font-size:15px; font-weight:600; }
+  .primary:disabled { opacity:.5; cursor:wait; }
+  .examples { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:12px; }
+  .examples button { background:#fff; border:1px solid var(--line); padding:4px 10px; font-size:12px; color:#555; border-radius:999px; }
+  .status { color:var(--muted); font-size:14px; margin:10px 0; min-height:20px; }
+  .notes { background:#e7f5ff; color:#1c4f80; border-radius:10px; padding:10px 14px; font-size:13px; margin-bottom:12px; }
+  .notes div + div { margin-top:4px; }
+  .req { font-size:13px; color:#555; margin-bottom:12px; display:flex; flex-wrap:wrap; gap:6px; }
+  .req span { background:#fff; border:1px solid var(--line); border-radius:6px; padding:2px 8px; }
+  .cards { display:grid; grid-template-columns:repeat(3, 1fr); gap:14px; }
+  @media (max-width: 820px) { .cards { grid-template-columns:1fr; } .input { flex-direction:column; } .primary { padding:12px; } }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:16px; display:flex; flex-direction:column; gap:10px; position:relative; }
+  .card.rec { border:2px solid var(--accent); }
+  .tag { position:absolute; top:-10px; right:12px; background:var(--accent); color:#fff; font-size:12px; padding:2px 8px; border-radius:999px; }
+  .card h2 { margin:0; font-size:18px; }
+  .price { font-size:26px; font-weight:700; color:var(--accent); }
+  .price small { font-size:13px; color:var(--muted); font-weight:400; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  td { padding:4px 0; border-bottom:1px dashed var(--line); }
+  td.r { text-align:right; color:#555; white-space:nowrap; }
+  .near { color:var(--warn); font-size:11px; margin-left:4px; }
+  .copy { font-size:14px; line-height:1.6; }
+  .copy .bless { color:#a61e4d; }
+  .internal { background:#f8f9fa; border:1px dashed #ced4da; border-radius:8px; padding:8px 10px; font-size:12px; color:#495057; }
+  .internal b { color:#868e96; font-weight:600; margin-right:4px; }
+  .low { color:var(--bad); font-weight:600; }
+  .review { font-size:12px; }
+  .review .pass { color:var(--ok); font-weight:600; }
+  .review .w { color:var(--warn); }
+  .review .s { color:var(--muted); }
+  .btn-copy { background:#2b2b2b; color:#fff; padding:8px; font-size:14px; margin-top:auto; }
+  .infeasible { background:#fff5f5; border:1px solid #ffc9c9; border-radius:14px; padding:16px; }
+  .infeasible h2 { color:var(--bad); margin:0 0 8px; font-size:18px; }
+  .infeasible ul { margin:6px 0; padding-left:20px; font-size:14px; }
+  .meta { color:var(--muted); font-size:12px; margin-top:14px; }
+</style>
+</head>
+<body>
+<div class="banner">提示：本页面的库存、价格与顾客需求均为模拟数据，仅用于演示。</div>
+<header>
+  <h1>🍊 水果礼盒 / 大单报价助手</h1>
+  <div class="sub">输入顾客的一句话需求，生成经济 / 标准 / 高档三档方案。价格由程序按价格表计算，老板确认后再发给顾客。</div>
+</header>
+<main>
+  <div class="input">
+    <textarea id="text" rows="2" placeholder="例如：公司春节发员工福利，80份礼盒，每份150块左右"></textarea>
+    <button class="primary" id="go">生成方案</button>
+  </div>
+  <div class="examples" id="examples"></div>
+  <div class="status" id="status"></div>
+  <div id="result"></div>
+</main>
+<script>
+const EXAMPLES = ["公司春节发员工福利，80份礼盒，每份150块左右", "下周去医院看望长辈，要一个200元左右的果篮",
+  "儿子结婚办酒席，回礼要30份，每份100元以内，要喜庆一点", "100份礼盒，每份都必须要有一斤草莓，预算每份120"];
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const fmt = (n) => Number(n).toFixed(2);
+const qty = (q) => (q % 1 === 0 ? q.toFixed(0) : String(q));
+
+EXAMPLES.forEach(e => { const b = document.createElement("button"); b.textContent = e; b.onclick = () => { $("text").value = e; }; $("examples").appendChild(b); });
+
+$("go").onclick = async () => {
+  const text = $("text").value.trim();
+  if (!text) { $("text").focus(); return; }
+  $("go").disabled = true; $("result").innerHTML = "";
+  const t0 = Date.now();
+  const timer = setInterval(() => { $("status").textContent = `AI 正在理解需求、搭配、核算、审核…（${Math.round((Date.now()-t0)/1000)} 秒）`; }, 500);
+  try {
+    const res = await fetch("/api/quote", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ text }) });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || res.statusText);
+    render(data);
+    $("status").textContent = "";
+  } catch (e) {
+    $("status").textContent = "出错了：" + e.message;
+  } finally { clearInterval(timer); $("go").disabled = false; }
+};
+$("text").addEventListener("keydown", e => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) $("go").click(); });
+
+function render(d) {
+  if (d.status === "error") { $("result").innerHTML = `<div class="infeasible"><h2>生成失败，请重试</h2>${esc(d.error)}</div><div class="meta">耗时 ${d.elapsed_s} 秒</div>`; return; }
+  const r = d.requirement || {};
+  let html = "";
+  html += `<div class="req"><span>场合：${esc(r.occasion)}</span><span>份数：${esc(r.quantity)}</span>
+    <span>每份预算：${r.budget_per_box ? esc(r.budget_per_box) + " 元" + (r.budget_type === "max" ? "以内" : "左右") : "未说明"}</span>
+    ${r.event_in_days != null ? `<span>${esc(r.event_in_days)} 天后使用</span>` : ""}
+    ${(r.preferences||[]).map(p => `<span>${esc(p)}</span>`).join("")}</div>`;
+  if (d.notes && d.notes.length) html += `<div class="notes">${d.notes.map(n => `<div>ℹ️ ${esc(n)}</div>`).join("")}</div>`;
+  if (d.status === "ok") {
+    html += `<div class="cards">` + d.tiers.map((t, i) => card(t, r, i)).join("") + `</div>`;
+  } else {
+    html += `<div class="infeasible"><h2>❌ 不可行</h2><div>原因：</div><ul>${(d.infeasible_reasons||[]).map(x => `<li>${esc(x)}</li>`).join("")}</ul>
+      <div>替代建议：</div><ul>${(d.suggestions||[]).map(x => `<li>${esc(x)}</li>`).join("")}</ul></div>`;
+  }
+  html += `<div class="meta">耗时 ${d.elapsed_s} 秒 · 调用模型 ${d.usage.calls} 次 · 成本约 $${d.usage.cost_usd.toFixed(4)} · 搭配 ${d.attempts} 次</div>`;
+  $("result").innerHTML = html;
+  window.__tiers = d.tiers || [];
+}
+
+function card(t, r, i) {
+  const rows = t.lines.map(l => `<tr><td>${esc(l.name)}${l.shelf_days_left <= 5 ? `<span class="near">临期优先</span>` : ""}</td>
+    <td class="r">${qty(l.qty)}${esc(l.unit)}</td><td class="r">${fmt(l.line_price)}</td></tr>`).join("")
+    + `<tr><td>${esc(t.packaging.name)}</td><td class="r">1个</td><td class="r">${fmt(t.packaging.price)}</td></tr>`;
+  const rv = t.review || {};
+  return `<div class="card ${t.recommended ? "rec" : ""}">
+    ${t.recommended ? `<div class="tag">推荐</div>` : ""}
+    <h2>${esc(t.tier)}款</h2>
+    <div class="price">${fmt(t.unit_price)} <small>元/份 · 合计 ${fmt(t.total_price)} 元（${esc(r.quantity)} 份）</small></div>
+    <table>${rows}</table>
+    <div class="copy"><div>${esc(t.intro)}</div><div class="bless">“${esc(t.blessing)}”</div></div>
+    <div class="internal"><b>内部</b>成本 ${fmt(t.unit_cost)} 元/份 · 毛利率 <span class="${t.margin_warning ? "low" : ""}">${(t.gross_margin*100).toFixed(0)}%${t.margin_warning ? " ⚠ 低于 20%" : ""}</span></div>
+    <div class="review"><span class="pass">✔ 审核通过</span>
+      ${(rv.warnings||[]).map(w => `<div class="w">⚠ ${esc(w)}</div>`).join("")}
+      ${(rv.suggestions||[]).map(s => `<div class="s">· ${esc(s)}</div>`).join("")}</div>
+    <button class="btn-copy" onclick="copyQuote(${i}, this)">复制报价</button>
+  </div>`;
+}
+
+async function copyQuote(i, btn) {
+  const text = window.__tiers[i].quote_text;
+  try { await navigator.clipboard.writeText(text); }
+  catch { const ta = document.createElement("textarea"); ta.value = text; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove(); }
+  const old = btn.textContent; btn.textContent = "已复制 ✓"; setTimeout(() => btn.textContent = old, 1500);
+}
+</script>
+</body>
+</html>
