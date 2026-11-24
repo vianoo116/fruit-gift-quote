@@ -1,18 +1,23 @@
-"""程序规则：可用商品筛选、不可行预检、价格微调、方案校验。"""
+"""程序规则：候选筛选与排序、不可行预检、组装用量微调、方案校验。能用规则做的都在这里做，减少模型调用。"""
 from __future__ import annotations
 
 import math
 import re
+from itertools import combinations
 
-from .inventory import Item, fruits, load_inventory
+from .inventory import Item, boxes, bulk_fruits, load_inventory
 from .pricing import price_plan
-from .rules import (MIN_FRUIT_KINDS, MIN_FRUIT_WEIGHT_JIN, NEAR_EXPIRY_DAYS, TIER_PACKAGING, TIERS,
-                    min_shelf_days, taboo_skus)
+from .rules import (ASSEMBLY_MAX_JIN, ASSEMBLY_MAX_KINDS, ASSEMBLY_MIN_JIN, ASSEMBLY_MIN_KINDS,
+                    ASSEMBLY_PACKAGING, DURIAN_SKU, HEALTH_KEYWORDS, HIGH_SUGAR_SPECIES, NEAR_EXPIRY_DAYS, SUGAR_KEYWORDS,
+                    TIERS, min_shelf_days, scene_rule, taboo_skus)
+
+KIND_LABEL = {"single": "单款整箱", "main_small": "主礼盒 + 伴手礼小盒", "two_main": "两款整箱组合"}
 
 
+# ---------------- 通用 ----------------
 def excluded_skus(req: dict) -> dict[str, str]:
-    """忌讳表 + 顾客明确不要的商品。"""
     out = taboo_skus(req["occasion"])
+    out.setdefault(DURIAN_SKU, "榴莲按个零售，不属于礼盒")
     inv = load_inventory()
     for s in req.get("exclude_skus") or []:
         if s in inv:
@@ -20,195 +25,358 @@ def excluded_skus(req: dict) -> dict[str, str]:
     return out
 
 
-def allowed_fruits(req: dict) -> tuple[list[Item], dict[str, str]]:
-    """返回可用水果，以及每个被排除商品的原因。"""
+def _filter(req: dict, items: list[Item], need_per_box: float = 1.0) -> tuple[list[Item], dict[str, str]]:
     q = req["quantity"]
     excl = excluded_skus(req)
     min_shelf = min_shelf_days(req.get("event_in_days"))
+    low_sugar = any(k in req.get("raw_text", "") for k in SUGAR_KEYWORDS)
     allowed, reasons = [], {}
-    for it in fruits():
-        if not it.is_gift_fruit:
-            reasons[it.sku_id] = "不适合做礼盒"
-        elif it.sku_id in excl:
+    for it in items:
+        need = q * (it.step if it.is_bulk else need_per_box)
+        if it.sku_id in excl:
             reasons[it.sku_id] = excl[it.sku_id]
+        elif low_sugar and any(h in it.name for h in HIGH_SUGAR_SPECIES):
+            reasons[it.sku_id] = "顾客要求少糖，避开高糖水果"
         elif it.shelf_days_left < min_shelf:
             reasons[it.sku_id] = f"剩余保鲜 {it.shelf_days_left} 天，不足 {min_shelf} 天"
-        elif it.stock < q * it.step:
-            reasons[it.sku_id] = f"库存 {it.stock:g}{it.unit} 不够 {q} 份"
+        elif it.stock < need:
+            reasons[it.sku_id] = f"库存 {it.stock:g}{it.unit}，不够 {q} 份"
         else:
             allowed.append(it)
     return allowed, reasons
 
 
-def priority_ids(allowed: list[Item]) -> set[str]:
-    """优先清库存：剩余保鲜天数短（≤7 天）且库存较多（≥80）的水果。"""
-    return {it.sku_id for it in allowed if it.shelf_days_left <= 7 and it.stock >= 80}
+def allowed_boxes(req: dict):
+    return _filter(req, boxes())
 
 
-def _min_box_price(allowed: list[Item]) -> float | None:
-    """最便宜的合规礼盒价格（标准包装 + 两种最便宜的按斤水果凑够 3 斤）。"""
+def allowed_bulk(req: dict):
+    return _filter(req, bulk_fruits())
+
+
+def is_health(req: dict) -> bool:
+    return any(k in req.get("raw_text", "") for k in HEALTH_KEYWORDS)
+
+
+# ---------------- 整箱礼盒：候选组合 ----------------
+def box_options(req: dict, allowed: list[Item]) -> list[dict]:
+    """所有合规的「一份」组合：单款整箱、主礼盒 + 伴手礼小盒、两款不同整箱（店主确认可组合，最多 2 款）。"""
+    required = {r["sku_id"] for r in req.get("required_items") or []}
+    opts = []
+
+    def add(items: list[Item], kind: str):
+        skus = {i.sku_id for i in items}
+        if not required <= skus:
+            return
+        main = max(items, key=lambda i: i.wholesale_price)
+        opts.append({"items": [{"sku_id": i.sku_id, "qty": 1} for i in sorted(items, key=lambda i: -i.wholesale_price)],
+                     "price": round(sum(i.wholesale_price for i in items), 2), "kind": kind, "main": main.sku_id})
+
+    for a in allowed:
+        add([a], "single")
+    mains = [a for a in allowed if not a.is_small_box]
+    smalls = [a for a in allowed if a.is_small_box]
+    for m in mains:
+        for s in smalls:
+            add([m, s], "main_small")
+    for a, b in combinations(mains, 2):
+        add([a, b], "two_main")
+    for i, o in enumerate(sorted(opts, key=lambda o: o["price"])):
+        o["id"] = f"O{i + 1}"
+    return sorted(opts, key=lambda o: o["price"])
+
+
+def _pref_style(req: dict) -> tuple[str | None, bool]:
+    """返回 (偏好包装风格, 是否顾客亲口说的)。"""
+    if req.get("packaging_pref"):
+        return req["packaging_pref"], True
+    return scene_rule(req["occasion"]).get("packaging"), False
+
+
+def score_option(o: dict, tg: dict, req: dict) -> float:
+    """越小越好：先看是否落在目标价区间，再看场景档次、包装风格、寓意、临期清货等加减分。"""
     inv = load_inventory()
-    jin = sorted([it for it in allowed if it.unit == "斤"], key=lambda i: i.wholesale_price)
-    if len(jin) < MIN_FRUIT_KINDS:
-        return None
-    return inv["P01"].wholesale_price + jin[0].wholesale_price * 2 + jin[1].wholesale_price * 1
+    rule = scene_rule(req["occasion"])
+    main = inv[o["main"]]
+    in_win = tg["low"] - 1e-6 <= o["price"] <= tg["high"] + 1e-6
+    s = 0.0 if in_win else 1.0
+    s += abs(o["price"] - tg["target"]) / tg["target"] * 0.5
+    s += {"single": 0.0, "main_small": 0.04, "two_main": 0.12}[o["kind"]]
+    grades = rule.get("grades") or []
+    if main.grade in grades:
+        s -= 0.08 if grades.index(main.grade) == 0 else 0.04
+    if main.grade in (rule.get("avoid_grades") or []):
+        s += 0.10
+    if req.get("wants_premium") and main.grade == "高档":
+        s -= 0.08
+    style, explicit = _pref_style(req)
+    if style and main.packaging_style == style:
+        s -= 0.10 if explicit else 0.05
+    skus = [i["sku_id"] for i in o["items"]]
+    if any(x in (rule.get("prefer") or []) for x in skus):
+        s -= 0.04
+    if rule.get("small_box_first") and req["quantity"] >= 20 and any(inv[x].is_small_box for x in skus):
+        s -= 0.05
+    if main.shelf_days_left <= 7 and main.stock >= 60:  # 临期且库存多，优先清货
+        s -= 0.02
+    if is_health(req) and any(any(h in inv[x].name for h in HIGH_SUGAR_SPECIES) for x in skus):
+        s += 0.12
+    return s
 
 
-def precheck(req: dict, targets: dict) -> tuple[list[str], list[str]]:
-    """明显不可行的需求直接拦下，返回 (原因, 替代建议)。"""
+def shortlist(req: dict, options: list[dict], targets: dict, k: int = 5) -> dict[str, list[dict]]:
+    """每档的候选短名单。「两款整箱组合」只在该档没有单款/主+小礼盒落进区间时才进入候选。"""
+    out = {}
+    for t in TIERS:
+        tg = targets[t]
+
+        def in_win(o):
+            return tg["low"] - 1e-6 <= o["price"] <= tg["high"] + 1e-6
+        simple_fit = any(in_win(o) for o in options if o["kind"] != "two_main")
+        pool = [o for o in options if not (simple_fit and o["kind"] == "two_main")]
+        out[t] = sorted(pool, key=lambda o: score_option(o, tg, req))[:k]
+    return out
+
+
+def window_reachable(options: list[dict], tg: dict) -> bool:
+    return any(tg["low"] - 1e-6 <= o["price"] <= tg["high"] + 1e-6 for o in options)
+
+
+def arrange_tiers(picks: dict[str, dict | None], options: list[dict], targets: dict, req: dict) -> tuple[dict, list[str]]:
+    """程序兜底：保证标准款尽量落进预算、三档不重复且价格递增；实在没有合适的档位就空缺并说明。"""
+    notes = []
+    std = picks.get("标准")
+    tg = targets["标准"]
+    best_dist = min((abs(o["price"] - tg["target"]) for o in options), default=0)
+    out_of_win = std is not None and not (tg["low"] - 1e-6 <= std["price"] <= tg["high"] + 1e-6)
+    # 区间内有方案却选了区间外的；或区间内本来就没有方案，但 AI 没选最接近预算的
+    if std is None or (out_of_win and (window_reachable(options, tg) or abs(std["price"] - tg["target"]) > best_dist + 1e-6)):
+        best = shortlist(req, options, targets, k=1)["标准"]
+        std = best[0] if best else None
+        if std is not None and picks.get("标准") is not None:
+            notes.append("标准款：AI 所选不在预算区间，已由程序替换为最匹配的礼盒")
+    out = {"标准": std}
+    used = {std["id"]} if std else set()
+    for t, cmp in (("经济", lambda p: p < std["price"]), ("高档", lambda p: p > std["price"])):
+        p = picks.get(t)
+        if std is None:
+            out[t] = None
+            continue
+        if p is None or p["id"] in used or not cmp(p["price"]):
+            cands = [o for o in options if o["id"] not in used and cmp(o["price"])]
+            p = min(cands, key=lambda o: score_option(o, targets[t], req)) if cands else None
+            if picks.get(t) is not None:
+                notes.append(f"{t}款：AI 所选与其他档重复或价格顺序不对，已由程序调整")
+        if p is None:
+            notes.append(f"{t}款：库存和价位里没有合适的礼盒，本次只给出其余档位")
+        out[t] = p
+        if p:
+            used.add(p["id"])
+    return out, notes
+
+
+def alternatives_for(req: dict, targets: dict, n: int = 2, mentioned_text: str = "") -> list[dict]:
+    """推荐可代替的整箱礼盒（组装请求 / 榴莲请求时使用）。顾客提到的水果优先。"""
+    allowed, _ = allowed_boxes({**req, "required_items": []})
+    opts = box_options({**req, "required_items": []}, allowed)
+    tg = targets["标准"]
+
+    def s(o):
+        hit = sum(1 for i in o["items"] if mentioned_text and _mentions_species(mentioned_text, i["sku_id"]))
+        return score_option(o, tg, req) - 1.2 * hit  # 顾客点名的水果优先，其次才看价格
+    picked = []
+    for o in sorted(opts, key=s):
+        if all(o["main"] != p["main"] for p in picked):
+            picked.append(o)
+        if len(picked) >= n:
+            break
+    return picked
+
+
+def _mentions_species(text: str, sku: str) -> bool:
+    from .rules import mentions
+    return mentions(text, sku)
+
+
+def describe_option(o: dict) -> str:
+    inv = load_inventory()
+    return " + ".join(f"{inv[i['sku_id']].name}（{inv[i['sku_id']].spec}）" for i in o["items"]) + f"，{o['price']:.0f} 元/份"
+
+
+# ---------------- 不可行预检 ----------------
+def precheck(req: dict, targets: dict, options: list[dict]) -> tuple[list[str], list[str]]:
     inv = load_inventory()
     q = req["quantity"]
     reasons, suggestions = [], []
-    allowed, excl_reasons = allowed_fruits(req)
     std_high = targets["标准"]["high"]
     min_shelf = min_shelf_days(req.get("event_in_days"))
+    excl = excluded_skus(req)
 
-    req_price = 0.0
     for r in req.get("required_items") or []:
-        it = inv.get(r["sku_id"])
-        if it is None:
-            continue
+        it = inv[r["sku_id"]]
         need = float(r["qty"]) * q
-        if need > it.stock:
-            reasons.append(f"{it.name}库存只有 {it.stock:g}{it.unit}，{q} 份每份 {r['qty']:g}{it.unit} 需要 {need:g}{it.unit}，库存不够")
-            max_boxes = int(it.stock // float(r["qty"]))
-            suggestions.append(f"如果每份必须放{r['qty']:g}{it.unit}{it.name}，最多能做 {max_boxes} 份；或改为部分礼盒放{it.name}")
+        if it.stock < need:
+            reasons.append(f"{it.name}库存只有 {it.stock:g}{it.unit}，{q} 份需要 {need:g}{it.unit}，库存不够")
+            suggestions.append(f"如果每份都要{it.name}，最多能做 {int(it.stock // float(r['qty']))} 份；或只在部分礼盒里放")
         if it.shelf_days_left < min_shelf:
             reasons.append(f"{it.name}剩余保鲜只有 {it.shelf_days_left} 天，不满足送达后至少 {min_shelf} 天的要求")
-        if not it.is_gift_fruit:
-            reasons.append(f"{it.name}不适合做礼盒")
-        if r["sku_id"] in excluded_skus(req):
-            reasons.append(f"{it.name}与场合忌讳冲突：{excluded_skus(req)[r['sku_id']]}")
-        req_price += it.wholesale_price * float(r["qty"])
-    if req_price and req_price + inv["P01"].wholesale_price > std_high:
-        need = req_price + inv["P01"].wholesale_price
-        reasons.append(f"必放商品加标准包装单份已需 {need:.2f} 元，超过预算上限 {std_high:.2f} 元")
-        suggestions.append(f"把每份预算提高到 {math.ceil(need * 1.2)} 元左右，或减少必放商品的数量")
+        if r["sku_id"] in excl and r["sku_id"] != DURIAN_SKU:
+            reasons.append(f"{it.name}不能用：{excl[r['sku_id']]}")
+        unit = it.wholesale_price * float(r["qty"])
+        if unit > std_high:
+            reasons.append(f"{it.name}{it.wholesale_price:g} 元一{it.unit}，已超过每份预算上限 {std_high:.0f} 元")
+            suggestions.append(f"每份预算提高到 {math.ceil(unit / 10) * 10} 元以上，或换成其他礼盒")
+    if reasons:
+        return reasons, suggestions
 
-    min_price = _min_box_price(allowed)
-    if min_price is None:
-        reasons.append("可用水果不足两种（受忌讳、保鲜期或库存限制）")
+    if req.get("mode") == "assembly":
+        allowed, _ = allowed_bulk(req)
+        jin = sorted([b for b in allowed if b.unit == "斤"], key=lambda b: b.wholesale_price)
+        if len(allowed) < ASSEMBLY_MIN_KINDS:
+            reasons.append("可用于组装的散装水果不足 3 种")
+        elif len(jin) >= 3:
+            cheapest = inv["P01"].wholesale_price + jin[0].wholesale_price * 2 + jin[1].wholesale_price + jin[2].wholesale_price
+            if cheapest > std_high:
+                reasons.append(f"组装礼盒最少 3 种水果、4 斤加包装，单份至少 {cheapest:.2f} 元，超过预算上限 {std_high:.2f} 元")
+                suggestions.append("改选整箱礼盒，或提高预算")
+        return reasons, suggestions
+
+    if not options:
+        reasons.append("没有满足忌讳、保鲜期和库存要求的整箱礼盒")
         suggestions.append("减少份数或放宽日期要求")
-    elif min_price > std_high:
-        reasons.append(f"预算偏低：标准包装 {inv['P01'].wholesale_price:g} 元加最基本的 3 斤水果，单份至少要 {min_price:.2f} 元，超过预算上限 {std_high:.2f} 元")
-        suggestions.append(f"把每份预算提高到 {math.ceil(min_price / 10) * 10} 元以上；或不要礼盒包装，改为散装水果袋")
+    elif options[0]["price"] > std_high:
+        o = options[0]
+        reasons.append(f"预算偏低：最便宜的礼盒（{describe_option(o)}）也要 {o['price']:.0f} 元，超过预算上限 {std_high:.2f} 元")
+        suggestions.append(f"把每份预算提高到 {math.ceil(o['price'])} 元以上，可选{describe_option(o)}")
     return reasons, suggestions
 
 
+# ---------------- 组装礼盒：用量微调 ----------------
 def _weight(items: list[dict]) -> float:
     inv = load_inventory()
     return sum(inv[i["sku_id"]].weight_jin * float(i["qty"]) for i in items)
 
 
-def tune_quantities(items: list[dict], packaging_sku: str, quantity: int, target: dict,
-                    allowed_ids: set[str], prio: set[str]) -> list[dict]:
-    """程序微调用量，让单份价格落入目标区间（模型估价不准时兜底）。只调整已选商品的数量，不换品。"""
+def tune_assembly(items: list[dict], packaging_sku: str, quantity: int, target: dict, allowed_ids: set[str],
+                  min_qty: dict[str, float] | None = None) -> list[dict]:
+    """在已选水果内按半斤/一个微调用量，让单份价格落进目标区间，同时保持 4–8 斤。不换品。"""
     inv = load_inventory()
     items = [{"sku_id": i["sku_id"], "qty": float(i["qty"])} for i in items]
+    min_qty = min_qty or {}
+
+    def can_dec(i):  # 减完仍大于 0，且不少于顾客要求的量
+        return i["qty"] - inv[i["sku_id"]].step >= max(min_qty.get(i["sku_id"], 0), inv[i["sku_id"]].step) - 1e-9
 
     def price(its):
-        return price_plan(its, packaging_sku, quantity)["unit_price"]
+        return price_plan(its, quantity, packaging_sku)["unit_price"]
 
-    for _ in range(120):
-        p = price(items)
-        if target["low"] <= p <= target["high"]:
+    for _ in range(80):
+        p, w = price(items), _weight(items)
+        if target["low"] <= p <= target["high"] and ASSEMBLY_MIN_JIN <= w <= ASSEMBLY_MAX_JIN:
             break
-        if p < target["low"]:
-            # 加量：优先加临期优先品，其次单价合适的
+        if p < target["low"] or w < ASSEMBLY_MIN_JIN:
             cands = [i for i in items if i["sku_id"] in allowed_ids
                      and (i["qty"] + inv[i["sku_id"]].step) * quantity <= inv[i["sku_id"]].stock
-                     and p + inv[i["sku_id"]].wholesale_price * inv[i["sku_id"]].step <= target["high"]]
-            if not cands:
-                cands = [i for i in items if i["sku_id"] in allowed_ids
-                         and (i["qty"] + inv[i["sku_id"]].step) * quantity <= inv[i["sku_id"]].stock]
-                if not cands:
+                     and w + inv[i["sku_id"]].weight_jin * inv[i["sku_id"]].step <= ASSEMBLY_MAX_JIN]
+            if not cands and p < target["low"]:
+                # 重量已到上限但价格不够：先减一份最便宜（按斤算）的水果腾出重量，下一轮再加贵的
+                cheap = [i for i in items if can_dec(i)]
+                if not cheap:
                     break
-            cands.sort(key=lambda i: (i["sku_id"] not in prio, -inv[i["sku_id"]].wholesale_price * inv[i["sku_id"]].step
-                                      if p + inv[i["sku_id"]].wholesale_price * inv[i["sku_id"]].step <= target["high"] else 1e9))
-            c = cands[0]
-            c["qty"] += inv[c["sku_id"]].step
-        else:
-            # 减量：先减最贵的、且减完仍满足最低配置的
-            cands = []
-            for i in items:
-                step = inv[i["sku_id"]].step
-                if i["qty"] - step <= 0:
-                    continue
-                trial = [dict(x) for x in items]
-                for x in trial:
-                    if x["sku_id"] == i["sku_id"]:
-                        x["qty"] -= step
-                if _weight(trial) >= MIN_FRUIT_WEIGHT_JIN:
-                    cands.append(i)
+                c = min(cheap, key=lambda i: inv[i["sku_id"]].wholesale_price / inv[i["sku_id"]].weight_jin)
+                pricey = max(items, key=lambda i: inv[i["sku_id"]].wholesale_price / inv[i["sku_id"]].weight_jin)
+                if c is pricey or (pricey["qty"] + inv[pricey["sku_id"]].step) * quantity > inv[pricey["sku_id"]].stock:
+                    break
+                c["qty"] -= inv[c["sku_id"]].step
+                continue
             if not cands:
                 break
-            cands.sort(key=lambda i: -inv[i["sku_id"]].wholesale_price * inv[i["sku_id"]].step)
-            # 选一个减完后最接近区间的
-            best = None
-            for c in cands:
-                newp = p - inv[c["sku_id"]].wholesale_price * inv[c["sku_id"]].step
-                if newp >= target["low"]:
-                    best = c
-                    break
-            c = best or cands[0]
+            if p < target["low"]:  # 价格不够：加单价高的，少占重量
+                c = max(cands, key=lambda i: inv[i["sku_id"]].wholesale_price / inv[i["sku_id"]].weight_jin)
+            else:  # 重量不够：加便宜的
+                c = min(cands, key=lambda i: inv[i["sku_id"]].wholesale_price)
+            c["qty"] += inv[c["sku_id"]].step
+        else:  # 价格过高或超重：减
+            cands = [i for i in items if can_dec(i)
+                     and w - inv[i["sku_id"]].weight_jin * inv[i["sku_id"]].step >= ASSEMBLY_MIN_JIN]
+            if not cands:
+                break
+            if p > target["high"]:
+                c = max(cands, key=lambda i: inv[i["sku_id"]].wholesale_price)
+            else:
+                c = min(cands, key=lambda i: inv[i["sku_id"]].wholesale_price / inv[i["sku_id"]].weight_jin)
             c["qty"] -= inv[c["sku_id"]].step
     return items
 
 
+# ---------------- 方案校验 ----------------
 DIGIT_RE = re.compile(r"[0-9０-９]|元|块钱|￥|¥")
 
 
-def check_tiers(req: dict, tiers: list[dict], targets: dict, check_copy: bool = False) -> tuple[list[str], dict]:
+def check_tiers(req: dict, tiers: list[dict], targets: dict, options: list[dict] | None = None,
+                check_copy: bool = False) -> tuple[list[str], dict]:
     """程序规则校验。返回 (硬性问题列表, 每档 {issues, warnings})。"""
     inv = load_inventory()
     q = req["quantity"]
     excl = excluded_skus(req)
     min_shelf = min_shelf_days(req.get("event_in_days"))
-    problems: list[str] = []
-    per_tier: dict[str, dict] = {}
+    assembly = req.get("mode") == "assembly"
+    problems, per_tier = [], {}
     for t in tiers:
-        name = t["tier"]
+        name, items = t["tier"], t["items"]
         issues, warnings = [], []
-        items = t["items"]
-        if t["packaging"] != TIER_PACKAGING[name]:
-            issues.append(f"包装应为 {TIER_PACKAGING[name]}")
-        seen = set()
+        skus = [i["sku_id"] for i in items]
+        if len(set(skus)) != len(skus):
+            issues.append("同一商品重复出现")
         for i in items:
-            s = i["sku_id"]
-            it = inv.get(s)
-            if it is None or it.is_packaging:
-                issues.append(f"商品 {s} 不在库存表中")
+            it = inv.get(i["sku_id"])
+            if it is None:
+                issues.append(f"商品 {i['sku_id']} 不在库存表中")
                 continue
-            if s in seen:
-                issues.append(f"{it.name}重复出现")
-            seen.add(s)
+            if i["sku_id"] == DURIAN_SKU:
+                issues.append("榴莲按个零售，不能放进礼盒")
+            elif i["sku_id"] in excl:
+                issues.append(f"{it.name}不能用：{excl[i['sku_id']]}")
+            if assembly and not it.is_bulk:
+                issues.append(f"{it.name}不是可组装的散装水果")
+            if not assembly and not it.is_box:
+                issues.append(f"{it.name}不是整箱礼盒")
             if float(i["qty"]) <= 0:
                 issues.append(f"{it.name}用量必须大于 0")
-            if not it.is_gift_fruit:
-                issues.append(f"{it.name}不适合做礼盒")
-            if s in excl:
-                issues.append(f"{it.name}不能用：{excl[s]}")
             if float(i["qty"]) * q > it.stock:
                 issues.append(f"{it.name}库存不足：需要 {float(i['qty']) * q:g}{it.unit}，库存 {it.stock:g}{it.unit}")
             if it.shelf_days_left < min_shelf:
                 issues.append(f"{it.name}剩余保鲜 {it.shelf_days_left} 天，不足 {min_shelf} 天")
-        if any(i["sku_id"] not in inv for i in items):
+        if any(s not in inv for s in skus):
             per_tier[name] = {"issues": issues, "warnings": warnings}
             problems += [f"{name}款：{x}" for x in issues]
             continue
-        if len(seen) < MIN_FRUIT_KINDS:
-            issues.append(f"至少要 {MIN_FRUIT_KINDS} 种水果")
-        if _weight(items) < MIN_FRUIT_WEIGHT_JIN - 1e-6:
-            issues.append(f"水果合计不足 {MIN_FRUIT_WEIGHT_JIN:g} 斤")
+        if assembly:
+            kinds = len(set(skus))
+            if not ASSEMBLY_MIN_KINDS <= kinds <= ASSEMBLY_MAX_KINDS:
+                issues.append(f"组装礼盒要 {ASSEMBLY_MIN_KINDS}–{ASSEMBLY_MAX_KINDS} 种水果，现在 {kinds} 种")
+            w = _weight(items)
+            if not ASSEMBLY_MIN_JIN - 1e-6 <= w <= ASSEMBLY_MAX_JIN + 1e-6:
+                issues.append(f"单盒重量要 {ASSEMBLY_MIN_JIN:g}–{ASSEMBLY_MAX_JIN:g} 斤，现在约 {w:.1f} 斤")
+            species = [inv[s].species for s in skus]
+            if len(set(species)) != len(species):
+                issues.append("同一种水果不能放两个规格")
+        else:
+            if len(items) > 2:
+                issues.append("每份最多 2 款整箱礼盒")
+            if any(float(i["qty"]) != 1 for i in items):
+                issues.append("整箱礼盒每份每款 1 箱/盒")
         for r in req.get("required_items") or []:
             got = sum(float(i["qty"]) for i in items if i["sku_id"] == r["sku_id"])
-            if got < float(r["qty"]):
-                issues.append(f"缺少顾客要求必放的 {inv[r['sku_id']].name} {r['qty']:g}{inv[r['sku_id']].unit}")
-        plan = t["plan"]
-        tg = targets[name]
+            if got < float(r["qty"]) - 1e-6:
+                issues.append(f"缺少顾客要求的{inv[r['sku_id']].name}")
+        plan, tg = t["plan"], targets[name]
         if not (tg["low"] - 1e-6 <= plan["unit_price"] <= tg["high"] + 1e-6):
-            msg = f"单份价格 {plan['unit_price']:.2f} 元不在目标区间 {tg['low']:.2f}–{tg['high']:.2f} 元"
-            (issues if name == "标准" else warnings).append(msg)
+            gap = plan["unit_price"] - tg["target"]
+            msg = f"单份价格 {plan['unit_price']:.2f} 元，与目标价 {tg['target']:.0f} 元相差 {gap:+.0f} 元"
+            # 标准款：只有库存里确实有落进预算的方案时才算硬性问题（店主确认：预算优先，凑不上就选最接近的并提示）
+            reachable = assembly or (options is not None and window_reachable(options, tg))
+            (issues if name == "标准" and reachable else warnings).append(msg)
         if plan["margin_warning"]:
             warnings.append(f"毛利率 {plan['gross_margin'] * 100:.0f}% 低于 20% 底线")
         if check_copy:
@@ -217,20 +385,40 @@ def check_tiers(req: dict, tiers: list[dict], targets: dict, check_copy: bool = 
                     issues.append(f"文案中出现了数字或价格：{t.get(field)}")
         per_tier[name] = {"issues": issues, "warnings": warnings}
         problems += [f"{name}款：{x}" for x in issues]
-    prices = {t["tier"]: t["plan"]["unit_price"] for t in tiers if "plan" in t}
-    if len(prices) == 3 and not (prices["经济"] < prices["标准"] < prices["高档"]):
-        for t in TIERS:
-            per_tier.setdefault(t, {"issues": [], "warnings": []})["warnings"].append("三档价格未拉开梯度")
     return problems, per_tier
 
 
+def grade_warning(req: dict, tiers: list[dict]) -> str | None:
+    """预算优先：场景要求的档次在预算内够不上时提示（店主确认）。"""
+    inv = load_inventory()
+    rule = scene_rule(req["occasion"])
+    want = (rule.get("grades") or [None])[0]
+    if req.get("wants_premium"):
+        want = "高档"
+    if not want or want == "普通" or req.get("mode") == "assembly":
+        return None
+    std = next((t for t in tiers if t["tier"] == "标准"), None)
+    if std is None:
+        return None
+    main = max(std["items"], key=lambda i: inv[i["sku_id"]].wholesale_price)
+    order = {"普通": 0, "精品": 1, "高档": 2}
+    if order.get(inv[main["sku_id"]].grade, 0) >= order[want]:
+        return None
+    cheapest = min((b for b in boxes() if order.get(b.grade, 0) >= order[want]), key=lambda b: b.wholesale_price)
+    return f"该场景建议{want}礼盒，预算内的标准款档次偏低；预算提高到约 {cheapest.wholesale_price:.0f} 元可选{cheapest.name}"
+
+
 def near_expiry_ratio(tiers: list[dict]) -> float:
+    """方案金额中，剩余保鲜 ≤ 5 天的商品所占比例。"""
     inv = load_inventory()
     total = near = 0.0
     for t in tiers:
         for i in t["items"]:
-            w = inv[i["sku_id"]].weight_jin * float(i["qty"])
-            total += w
-            if inv[i["sku_id"]].shelf_days_left <= NEAR_EXPIRY_DAYS:
-                near += w
+            amt = inv[i["sku_id"]].wholesale_price * float(i["qty"])
+            total += amt
+            near += amt if inv[i["sku_id"]].shelf_days_left <= NEAR_EXPIRY_DAYS else 0
     return near / total if total else 0.0
+
+
+def assembly_packaging(tier: str) -> str:
+    return ASSEMBLY_PACKAGING[tier]
