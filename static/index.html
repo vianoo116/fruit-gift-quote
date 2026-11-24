@@ -51,13 +51,24 @@
   .infeasible h2 { color:var(--bad); margin:0 0 8px; font-size:18px; }
   .infeasible ul { margin:6px 0; padding-left:20px; font-size:14px; }
   .meta { color:var(--muted); font-size:12px; margin-top:14px; }
+  .steps { display:flex; gap:6px; margin:10px 0; flex-wrap:wrap; }
+  .step { flex:1; min-width:70px; text-align:center; font-size:13px; padding:8px 4px; border-radius:8px; background:#fff; border:1px solid var(--line); color:#aaa; }
+  .step.active { border-color:var(--accent); color:var(--accent); font-weight:600; animation: pulse 1.2s infinite; }
+  .step.done { background:#ebfbee; border-color:#b2f2bb; color:var(--ok); }
+  @keyframes pulse { 50% { opacity:.55; } }
+  .kind { display:inline-block; font-size:12px; color:#555; background:#f1f3f5; border-radius:6px; padding:1px 8px; margin-left:6px; vertical-align:middle; font-weight:400; }
+  .spec { color:var(--muted); font-size:11px; display:block; }
+  .chip { font-size:11px; border-radius:4px; padding:0 4px; margin-left:4px; border:1px solid var(--line); color:#666; }
+  .alts { background:#fff9db; border:1px solid #ffe066; border-radius:12px; padding:12px 14px; margin-bottom:12px; font-size:14px; }
+  .alts h3 { margin:0 0 6px; font-size:15px; }
+  .alts ul { margin:4px 0 0; padding-left:20px; }
 </style>
 </head>
 <body>
 <div class="banner">提示：本页面的库存、价格与顾客需求均为模拟数据，仅用于演示。</div>
 <header>
   <h1>🍊 水果礼盒 / 大单报价助手</h1>
-  <div class="sub">输入顾客的一句话需求，生成经济 / 标准 / 高档三档方案。价格由程序按价格表计算，老板确认后再发给顾客。</div>
+  <div class="sub">输入顾客的一句话需求，按场景推荐经济 / 标准 / 高档三档整箱原包装礼盒。价格由程序按价格表计算，老板确认后再发给顾客。</div>
 </header>
 <main>
   <div class="input">
@@ -65,12 +76,14 @@
     <button class="primary" id="go">生成方案</button>
   </div>
   <div class="examples" id="examples"></div>
+  <div class="steps" id="steps" hidden></div>
   <div class="status" id="status"></div>
   <div id="result"></div>
 </main>
 <script>
-const EXAMPLES = ["公司春节发员工福利，80份礼盒，每份150块左右", "下周去医院看望长辈，要一个200元左右的果篮",
-  "儿子结婚办酒席，回礼要30份，每份100元以内，要喜庆一点", "100份礼盒，每份都必须要有一斤草莓，预算每份120"];
+const EXAMPLES = ["公司春节发员工福利，80份礼盒，每份150块左右", "去拜访领导，2份，预算300，要有面子",
+  "婚礼伴手礼150份，每份25元左右，好看一点", "想要组装一个果篮，放葡萄、橙子和苹果，200块左右", "买个榴莲礼盒送人"];
+const STEPS = ["理解需求", "选礼盒", "核算", "审核"];
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const fmt = (n) => Number(n).toFixed(2);
@@ -78,17 +91,40 @@ const qty = (q) => (q % 1 === 0 ? q.toFixed(0) : String(q));
 
 EXAMPLES.forEach(e => { const b = document.createElement("button"); b.textContent = e; b.onclick = () => { $("text").value = e; }; $("examples").appendChild(b); });
 
+function setStep(cur, doneAll) {
+  const idx = STEPS.indexOf(cur);
+  $("steps").innerHTML = STEPS.map((n, i) => `<div class="step ${doneAll || i < idx ? "done" : i === idx ? "active" : ""}">${doneAll || i < idx ? "✓ " : ""}${n}</div>`).join("");
+}
+
 $("go").onclick = async () => {
   const text = $("text").value.trim();
   if (!text) { $("text").focus(); return; }
   $("go").disabled = true; $("result").innerHTML = "";
+  $("steps").hidden = false; setStep("理解需求");
   const t0 = Date.now();
-  const timer = setInterval(() => { $("status").textContent = `AI 正在理解需求、搭配、核算、审核…（${Math.round((Date.now()-t0)/1000)} 秒）`; }, 500);
+  const timer = setInterval(() => { $("status").textContent = `已用 ${Math.round((Date.now()-t0)/1000)} 秒`; }, 500);
   try {
-    const res = await fetch("/api/quote", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ text }) });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || res.statusText);
-    render(data);
+    const res = await fetch("/api/quote/stream", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ text }) });
+    if (!res.ok) throw new Error(res.statusText);
+    const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = "", result = null;
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let k;
+      while ((k = buf.indexOf("\n\n")) >= 0) {
+        const chunk = buf.slice(0, k); buf = buf.slice(k + 2);
+        const ev = (chunk.match(/^event: (.*)$/m) || [])[1], data = JSON.parse((chunk.match(/^data: (.*)$/m) || [])[1] || "null");
+        if (ev === "progress") {
+          // 某节点完成后，高亮下一个步骤
+          const next = { parse: "理解需求", precheck: "选礼盒", select: "核算", price: "审核", rework: "选礼盒" }[data.node];
+          if (next) setStep(next);
+        } else if (ev === "result") result = data;
+      }
+    }
+    if (!result) throw new Error("没有收到结果");
+    setStep(null, true);
+    render(result);
     $("status").textContent = "";
   } catch (e) {
     $("status").textContent = "出错了：" + e.message;
@@ -105,25 +141,29 @@ function render(d) {
     ${r.event_in_days != null ? `<span>${esc(r.event_in_days)} 天后使用</span>` : ""}
     ${(r.preferences||[]).map(p => `<span>${esc(p)}</span>`).join("")}</div>`;
   if (d.notes && d.notes.length) html += `<div class="notes">${d.notes.map(n => `<div>ℹ️ ${esc(n)}</div>`).join("")}</div>`;
+  if (d.alternatives) html += `<div class="alts"><h3>💡 建议先考虑整箱原包装礼盒</h3>${esc(d.alternatives.reason)}，可以代替的整箱礼盒：
+    <ul>${d.alternatives.options.map(o => `<li>${esc(o.desc)}</li>`).join("")}</ul><div style="margin-top:6px">顾客坚持组装的话，下面是组装方案：</div></div>`;
   if (d.status === "ok") {
     html += `<div class="cards">` + d.tiers.map((t, i) => card(t, r, i)).join("") + `</div>`;
   } else {
     html += `<div class="infeasible"><h2>❌ 不可行</h2><div>原因：</div><ul>${(d.infeasible_reasons||[]).map(x => `<li>${esc(x)}</li>`).join("")}</ul>
       <div>替代建议：</div><ul>${(d.suggestions||[]).map(x => `<li>${esc(x)}</li>`).join("")}</ul></div>`;
   }
-  html += `<div class="meta">耗时 ${d.elapsed_s} 秒 · 调用模型 ${d.usage.calls} 次 · 成本约 $${d.usage.cost_usd.toFixed(4)} · 搭配 ${d.attempts} 次</div>`;
+  html += `<div class="meta">耗时 ${d.elapsed_s} 秒 · 调用模型 ${d.usage.calls} 次 · 成本约 $${d.usage.cost_usd.toFixed(4)} · 选礼盒 ${d.attempts} 次</div>`;
   $("result").innerHTML = html;
   window.__tiers = d.tiers || [];
 }
 
 function card(t, r, i) {
-  const rows = t.lines.map(l => `<tr><td>${esc(l.name)}${l.shelf_days_left <= 5 ? `<span class="near">临期优先</span>` : ""}</td>
+  const box = (l) => l.type === "整箱礼盒";
+  const rows = t.lines.map(l => `<tr><td>${esc(l.name)}${box(l) ? `<span class="chip">${esc(l.grade)}</span><span class="chip">${esc(l.packaging_style)}</span>` : ""}${l.shelf_days_left <= 5 ? `<span class="near">临期优先</span>` : ""}
+    ${box(l) ? `<span class="spec">${esc(l.spec)} · 保鲜 ${l.shelf_days_left} 天</span>` : ""}</td>
     <td class="r">${qty(l.qty)}${esc(l.unit)}</td><td class="r">${fmt(l.line_price)}</td></tr>`).join("")
-    + `<tr><td>${esc(t.packaging.name)}</td><td class="r">1个</td><td class="r">${fmt(t.packaging.price)}</td></tr>`;
+    + (t.packaging ? `<tr><td>${esc(t.packaging.name)}</td><td class="r">1个</td><td class="r">${fmt(t.packaging.price)}</td></tr>` : "");
   const rv = t.review || {};
   return `<div class="card ${t.recommended ? "rec" : ""}">
     ${t.recommended ? `<div class="tag">推荐</div>` : ""}
-    <h2>${esc(t.tier)}款</h2>
+    <h2>${esc(t.tier)}款<span class="kind">${esc(t.kind)}</span></h2>
     <div class="price">${fmt(t.unit_price)} <small>元/份 · 合计 ${fmt(t.total_price)} 元（${esc(r.quantity)} 份）</small></div>
     <table>${rows}</table>
     <div class="copy"><div>${esc(t.intro)}</div><div class="bless">“${esc(t.blessing)}”</div></div>

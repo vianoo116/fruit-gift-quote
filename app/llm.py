@@ -73,7 +73,7 @@ def _extract_json(text: str) -> dict:
     raise LLMError(f"模型未返回 JSON：{text[:200]}")
 
 
-def chat_json(agent: str, system: str, user: str, max_tokens: int = 2000) -> dict:
+def chat_json(agent: str, system: str, user: str, max_tokens: int = 2000, reasoning: bool = False) -> dict:
     """调用模型并解析 JSON 输出，记录 token 与费用。"""
     global _process_cost
     if _process_cost >= max_cost():
@@ -87,7 +87,8 @@ def chat_json(agent: str, system: str, user: str, max_tokens: int = 2000) -> dic
             response_format={"type": "json_object"},
             temperature=0.3,
             max_tokens=max_tokens * (attempt + 1),
-            extra_body={"usage": {"include": True}, "reasoning": {"effort": "low"}},
+            extra_body={"usage": {"include": True},
+                        "reasoning": {"effort": "low"} if reasoning else {"enabled": False}},
         )
         usage = resp.usage
         cost = float(getattr(usage, "cost", 0.0) or (usage.model_extra or {}).get("cost", 0.0) or 0.0) if usage else 0.0
@@ -104,6 +105,8 @@ def chat_json(agent: str, system: str, user: str, max_tokens: int = 2000) -> dic
             a["cost_usd"] += cost
             a["seconds"] += time.time() - t0
         content = (resp.choices[0].message.content or "") if resp.choices else ""
+        if not content.strip():  # 推理 token 用完导致空内容：关掉推理、加大上限重试
+            reasoning = False
         try:
             return _extract_json(content)
         except (LLMError, json.JSONDecodeError) as e:
