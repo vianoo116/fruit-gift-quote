@@ -1,0 +1,19 @@
+# Render Blueprint：免费版 Web Service
+# OPENROUTER_API_KEY 设为 sync: false —— 不写进仓库，在 Render 网页上创建时手动填写。
+services:
+  - type: web
+    name: fruit-gift-quote
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --proxy-headers
+    healthCheckPath: /api/health
+    envVars:
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: OPENROUTER_MODEL
+        value: deepseek/deepseek-v4.1-flash-1017
+      - key: MAX_COST_USD
+        value: "1"
+      - key: PYTHON_VERSION
+        value: 3.12.8

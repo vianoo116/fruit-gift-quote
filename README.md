@@ -1,10 +1,10 @@
 # fruit-gift-quote · 水果礼盒 / 大单报价助手
 
+![演示：输入需求 → 实时进度 → 三档方案 → 复制报价](docs/demo.gif)
+
 **一句话介绍**：输入顾客的一句话需求（如"去拜访领导，2 份，预算 300，要有面子"），多个 AI Agent 按场景规则推荐**经济 / 标准 / 高档三档整箱原包装礼盒**，价格、成本、毛利全部由代码按价格表计算，并经过规则 + AI 双重审核，老板确认后一键复制发给顾客。
 
 > ⚠️ 项目中的库存、价格和顾客需求均为**参照真实情况编写的模拟数据**；访谈洞察和场景规则来自真实经营者。
-
-![桌面端：拜访领导](docs/01-visit-leader.png)
 
 ## 为什么做
 
@@ -130,6 +130,21 @@ python eval/run_eval.py --workers 4
 
 **默认模型**：`deepseek/deepseek-v4.1-flash-1017`（DeepSeek V4.1 Flash 的 2026-10-17 固定快照）。中文好、支持 JSON 输出、价格很低；用固定快照，评测结果更可复现。v1.1 只给「选礼盒」开低强度推理，其余 Agent 关闭推理，单次调用约 2 秒。
 
+## 部署到 Render（免费版）
+
+仓库根目录的 [`render.yaml`](render.yaml) 是 Render Blueprint 配置：Python Web Service、免费实例、健康检查 `/api/health`，`MAX_COST_USD=1`。**OpenRouter 密钥不写进仓库**，只在 Render 网页上填写（`sync: false`）。
+
+1. 登录 [Render](https://render.com)，用 GitHub 账号授权，并允许 Render 访问本仓库。
+2. 点 **New → Blueprint**，选择本仓库，分支选 `main`。
+3. Render 读取 `render.yaml` 后，会要求填写 `OPENROUTER_API_KEY`：粘贴你的 OpenRouter 密钥，点 **Apply / Deploy**。
+4. 等待构建完成（几分钟），打开 Render 给的 `https://xxx.onrender.com` 地址即可使用。
+
+注意：
+
+- 免费实例闲置一段时间后会休眠，下次访问要等几十秒唤醒。
+- `MAX_COST_USD` 是**单个进程**的累计上限，实例休眠重启后会重新计数。要设真正的总额上限，请在 OpenRouter 后台给这个密钥设置额度（Credit limit）。
+- 部署后的网址是公开的，任何人都能调用、消耗你的额度；建议只给需要的人，并设好上面的额度。
+
 ## 数据说明
 
 - [`data/inventory.csv`](data/inventory.csv)：20 款整箱礼盒（type=整箱礼盒，含规格、档次 grade、包装风格 packaging_style）、12 种散装水果（只用于组装礼盒）、2 种组装包装。**模拟数据**。
@@ -214,5 +229,6 @@ app/
 static/index.html  单页网页
 eval/run_eval.py   评测脚本；eval/results.md 评测结果
 data/              模拟数据
-docs/              场景规则表、网页截图
+docs/              场景规则表、网页截图、演示动图
+render.yaml        Render 部署配置
 ```
