@@ -1,5 +1,7 @@
 # fruit-gift-quote · 水果礼盒 / 大单报价助手
 
+**🔗 在线体验：<https://fruit-gift-quote.onrender.com>**（免费实例闲置后首次打开需等待约 30–60 秒）
+
 ![演示：输入需求 → 实时进度 → 三档方案 → 复制报价](docs/demo.gif)
 
 **一句话介绍**：输入顾客的一句话需求（如"去拜访领导，2 份，预算 300，要有面子"），多个 AI Agent 按场景规则推荐**经济 / 标准 / 高档三档整箱原包装礼盒**，价格、成本、毛利全部由代码按价格表计算，并经过规则 + AI 双重审核，老板确认后一键复制发给顾客。
@@ -137,7 +139,7 @@ python eval/run_eval.py --workers 4
 1. 登录 [Render](https://render.com)，用 GitHub 账号授权，并允许 Render 访问本仓库。
 2. 点 **New → Blueprint**，选择本仓库，分支选 `main`。
 3. Render 读取 `render.yaml` 后，会要求填写 `OPENROUTER_API_KEY`：粘贴你的 OpenRouter 密钥，点 **Apply / Deploy**。
-4. 等待构建完成（几分钟），打开 Render 给的 `https://xxx.onrender.com` 地址即可使用。
+4. 等待构建完成（几分钟），打开 Render 给的 `https://<服务名>.onrender.com` 地址即可使用（本项目的线上地址：<https://fruit-gift-quote.onrender.com>）。
 
 注意：
 
