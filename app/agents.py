@@ -68,7 +68,7 @@ def select_boxes(req: dict, short: dict, targets: dict, feedback: list[str]) -> 
         lines += [_opt_line(o, tg) for o in opts]
     if feedback:
         lines.append("【上一版未通过审核，请换候选】" + "；".join(feedback))
-    return chat_json("选礼盒", SELECT_BOX_SYSTEM, "\n".join(lines), max_tokens=1500, reasoning=True)
+    return chat_json("选礼盒", SELECT_BOX_SYSTEM, "\n".join(lines), max_tokens=1500)
 
 
 # ---------------- ② 选礼盒 Agent（组装，仅顾客明确要求时） ----------------

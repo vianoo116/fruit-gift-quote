@@ -9,7 +9,8 @@ from .inventory import Item, boxes, bulk_fruits, load_inventory
 from .pricing import price_plan
 from .rules import (ASSEMBLY_MAX_JIN, ASSEMBLY_MAX_KINDS, ASSEMBLY_MIN_JIN, ASSEMBLY_MIN_KINDS,
                     ASSEMBLY_PACKAGING, DURIAN_SKU, HEALTH_KEYWORDS, HIGH_SUGAR_SPECIES, NEAR_EXPIRY_DAYS, SUGAR_KEYWORDS,
-                    TIERS, min_shelf_days, scene_rule, taboo_skus)
+                    PREMIUM_ALLOWED_GRADES, RETURN_GIFT_SCENES, SMALL_BOX_ONLY_MSG, TIERS, min_shelf_days,
+                    scene_of, scene_rule, taboo_skus)
 
 KIND_LABEL = {"single": "单款整箱", "main_small": "主礼盒 + 伴手礼小盒", "two_main": "两款整箱组合"}
 
@@ -30,11 +31,15 @@ def _filter(req: dict, items: list[Item], need_per_box: float = 1.0) -> tuple[li
     excl = excluded_skus(req)
     min_shelf = min_shelf_days(req.get("event_in_days"))
     low_sugar = any(k in req.get("raw_text", "") for k in SUGAR_KEYWORDS)
+    return_gift = scene_of(req.get("occasion")) in RETURN_GIFT_SCENES
+    required = {r["sku_id"] for r in req.get("required_items") or []}
     allowed, reasons = [], {}
     for it in items:
         need = q * (it.step if it.is_bulk else need_per_box)
         if it.sku_id in excl:
             reasons[it.sku_id] = excl[it.sku_id]
+        elif it.is_small_box and not return_gift and it.sku_id not in required:
+            reasons[it.sku_id] = SMALL_BOX_ONLY_MSG
         elif low_sugar and any(h in it.name for h in HIGH_SUGAR_SPECIES):
             reasons[it.sku_id] = "顾客要求少糖，避开高糖水果"
         elif it.shelf_days_left < min_shelf:
@@ -124,16 +129,29 @@ def score_option(o: dict, tg: dict, req: dict) -> float:
     return s
 
 
+def premium_ok(o: dict) -> bool:
+    """高档款里所有商品都必须是精品或高档（店主规则）。"""
+    inv = load_inventory()
+    return all(inv[i["sku_id"]].grade in PREMIUM_ALLOWED_GRADES for i in o["items"])
+
+
 def shortlist(req: dict, options: list[dict], targets: dict, k: int = 5) -> dict[str, list[dict]]:
-    """每档的候选短名单。「两款整箱组合」只在该档没有单款/主+小礼盒落进区间时才进入候选。"""
+    """每档的候选短名单。「两款整箱组合」只在该档没有单款/主+小礼盒落进区间时才进入候选；高档只放全是精品/高档的组合。"""
     out = {}
     for t in TIERS:
         tg = targets[t]
+        tier_opts = [o for o in options if premium_ok(o)] if t == "高档" else options
 
         def in_win(o):
             return tg["low"] - 1e-6 <= o["price"] <= tg["high"] + 1e-6
-        simple_fit = any(in_win(o) for o in options if o["kind"] != "two_main")
-        pool = [o for o in options if not (simple_fit and o["kind"] == "two_main")]
+        simple_fit = any(in_win(o) for o in tier_opts if o["kind"] != "two_main")
+        pool = [o for o in tier_opts if not (simple_fit and o["kind"] == "two_main")]
+        style, explicit = _pref_style(req)
+        if t == "标准" and explicit:  # 顾客亲口说的包装偏好：区间内有匹配风格的，就只给这些候选
+            inv = load_inventory()
+            match = [o for o in pool if in_win(o) and inv[o["main"]].packaging_style == style]
+            if match:
+                pool = match
         out[t] = sorted(pool, key=lambda o: score_option(o, tg, req))[:k]
     return out
 
@@ -162,11 +180,13 @@ def arrange_tiers(picks: dict[str, dict | None], options: list[dict], targets: d
         if std is None:
             out[t] = None
             continue
-        if p is None or p["id"] in used or not cmp(p["price"]):
-            cands = [o for o in options if o["id"] not in used and cmp(o["price"])]
-            p = min(cands, key=lambda o: score_option(o, targets[t], req)) if cands else None
+        ok = (lambda o: premium_ok(o)) if t == "高档" else (lambda o: True)
+        if p is None or p["id"] in used or not cmp(p["price"]) or not ok(p):
+            cands = [o for o in options if o["id"] not in used and cmp(o["price"]) and ok(o)]
             if picks.get(t) is not None:
-                notes.append(f"{t}款：AI 所选与其他档重复或价格顺序不对，已由程序调整")
+                why = "含普通档商品" if not ok(picks[t]) else "与其他档重复或价格顺序不对"
+                notes.append(f"{t}款：AI 所选{why}，已由程序调整")
+            p = min(cands, key=lambda o: score_option(o, targets[t], req)) if cands else None
         if p is None:
             notes.append(f"{t}款：库存和价位里没有合适的礼盒，本次只给出其余档位")
         out[t] = p
@@ -364,6 +384,11 @@ def check_tiers(req: dict, tiers: list[dict], targets: dict, options: list[dict]
         else:
             if len(items) > 2:
                 issues.append("每份最多 2 款整箱礼盒")
+            if name == "高档" and any(inv[s].grade not in PREMIUM_ALLOWED_GRADES for s in skus):
+                issues.append("高档款只能用精品或高档礼盒，不能搭配普通档商品")
+            if scene_of(req.get("occasion")) not in RETURN_GIFT_SCENES and any(
+                    inv[s].is_small_box and s not in {r["sku_id"] for r in req.get("required_items") or []} for s in skus):
+                issues.append(SMALL_BOX_ONLY_MSG)
             if any(float(i["qty"]) != 1 for i in items):
                 issues.append("整箱礼盒每份每款 1 箱/盒")
         for r in req.get("required_items") or []:
@@ -422,3 +447,22 @@ def near_expiry_ratio(tiers: list[dict]) -> float:
 
 def assembly_packaging(tier: str) -> str:
     return ASSEMBLY_PACKAGING[tier]
+
+
+def choose_recommended(tiers: list[dict], req: dict) -> tuple[str | None, str | None]:
+    """「推荐」标签（店主规则）：默认推荐标准款（顾客要高档时推荐高档款），但优先给毛利率不低于 20% 的方案；
+    三档都低于底线时推荐毛利率最高的一档，并提示店主。返回 (推荐档位, 给店主的提示)。"""
+    present = {t["tier"]: t for t in tiers}
+    if not present:
+        return None, None
+    default = "高档" if req.get("wants_premium") else "标准"
+    order = [default] + [t for t in (["标准", "高档", "经济"] if default == "标准" else ["标准", "经济"]) if t != default]
+    order = [t for t in order if t in present]
+    for t in order:
+        if not present[t]["plan"]["margin_warning"]:
+            if t != order[0]:
+                m = present[order[0]]["plan"]["gross_margin"] * 100
+                return t, f"{order[0]}款毛利率只有 {m:.0f}%，低于 20% 底线，改为推荐{t}款"
+            return t, None
+    best = max(order, key=lambda t: present[t]["plan"]["gross_margin"])
+    return best, f"三档毛利率都低于 20% 底线，已推荐毛利率最高的{best}款（{present[best]['plan']['gross_margin'] * 100:.0f}%），请店主确认是否接受"

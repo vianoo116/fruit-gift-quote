@@ -85,6 +85,15 @@ def wants_assembly(text: str) -> bool:
     return any(w in text for w in ASSEMBLY_KEYWORDS)
 
 
+# ---- 店主规则（v1.1 补充）----
+# 高档款里所有商品的档次都必须是精品或高档，不能搭配普通档的小盒
+PREMIUM_ALLOWED_GRADES = {"精品", "高档"}
+# 伴手礼小盒（砂糖橘、金桔）只用于婚庆、满月等回礼场景（满月在场景表里归入婚庆）
+RETURN_GIFT_SCENES = {"婚庆"}
+SMALL_BOX_ONLY_MSG = "伴手礼小盒只用于婚庆、满月等回礼场景"
+# 「推荐」标签：优先给毛利率不低于底线的方案
+
+
 # ---- 三档定价（店主确认：经济 0.8 / 标准 1.0 / 高档 1.3 倍预算）----
 TIERS = ["经济", "标准", "高档"]
 TIER_RATIO = {"经济": 0.8, "标准": 1.0, "高档": 1.3}
