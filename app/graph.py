@@ -7,7 +7,7 @@ from typing import Any, Callable, TypedDict
 from langgraph.graph import END, StateGraph
 
 from . import agents
-from .checks import (KIND_LABEL, allowed_boxes, allowed_bulk, alternatives_for, arrange_tiers,
+from .checks import (KIND_LABEL, allowed_boxes, allowed_bulk, alternatives_for, arrange_tiers, choose_recommended,
                      assembly_packaging, box_options, check_tiers, describe_option, grade_warning,
                      near_expiry_ratio, precheck, shortlist, tune_assembly)
 from .inventory import load_inventory
@@ -320,7 +320,9 @@ def build_output(text: str, state: State, usage: dict, elapsed: float) -> dict:
         out["alternatives"] = {"reason": ASSEMBLY_REASON, "options": [
             {"desc": describe_option(o), "price": o["price"], "items": o["items"]} for o in alts]}
     if state.get("status") == "ok":
-        recommended = "高档" if req.get("wants_premium") else "标准"
+        recommended, rec_note = choose_recommended(state["tiers"], req)
+        if rec_note:
+            notes.append("（内部）" + rec_note)
         gw = grade_warning(req, state["tiers"])
         if gw:
             notes.append(gw)

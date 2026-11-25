@@ -19,7 +19,8 @@ sys.path.insert(0, str(ROOT))
 from app.graph import run  # noqa: E402
 from app.inventory import load_inventory  # noqa: E402
 from app.llm import model_name, process_cost  # noqa: E402
-from app.rules import ASSEMBLY_PACKAGING, NEAR_EXPIRY_DAYS, tier_targets  # noqa: E402
+from app.rules import (ASSEMBLY_PACKAGING, MARGIN_FLOOR, NEAR_EXPIRY_DAYS, PREMIUM_ALLOWED_GRADES,  # noqa: E402
+                       RETURN_GIFT_SCENES, scene_of, tier_targets)
 
 CASES = ROOT / "data" / "test_cases.json"
 OUT_MD = ROOT / "eval" / "results.md"
@@ -87,6 +88,16 @@ def evaluate_case(case: dict, res: dict) -> dict:
             f"{ln['name']}{'' if ln['type'] == '整箱礼盒' and ln['qty'] == 1 else ' ' + format(ln['qty'], 'g') + ln['unit']}"
             for ln in t["lines"]) for t in tiers}
         row["alternatives"] = [o["desc"] for o in (res.get("alternatives") or {}).get("options", [])]
+        # v1.1 店主补充规则
+        row["premium_low_grade"] = 0 if assembly else sum(
+            1 for t in tiers if t["tier"] == "高档" for i in t["items"] if inv[i["sku_id"]].grade not in PREMIUM_ALLOWED_GRADES)
+        row["small_box_misuse"] = 0 if scene_of(req.get("occasion")) in RETURN_GIFT_SCENES else sum(
+            1 for t in tiers for i in t["items"] if inv[i["sku_id"]].is_small_box)
+        rec = next((t for t in tiers if t.get("recommended")), None)
+        any_ok = any(t["gross_margin"] >= MARGIN_FLOOR for t in tiers)
+        row["rec_tier"] = rec["tier"] if rec else None
+        row["rec_margin_ok"] = (rec is not None and (rec["gross_margin"] >= MARGIN_FLOOR if any_ok
+                                                      else rec["gross_margin"] == max(t["gross_margin"] for t in tiers)))
     else:
         row["reasons"] = (res.get("infeasible_reasons") or [res.get("error", "")]) + [f"建议：{x}" for x in res.get("suggestions") or []]
     return row
@@ -114,6 +125,9 @@ def summarize(rows: list[dict]) -> dict:
         "库存可行率": (pct(sum(stock), len(stock)), "100%"),
         "忌讳违规数": (str(sum(r["taboo_violations"] for r in ok_rows)), "0"),
         "榴莲误入礼盒次数": (str(sum(r["durian_in_box"] for r in rows)), "0"),
+        "高档款含普通档商品次数": (str(sum(r.get("premium_low_grade", 0) for r in ok_rows)), "0"),
+        "非回礼场景使用伴手礼小盒次数": (str(sum(r.get("small_box_misuse", 0) for r in ok_rows)), "0"),
+        "推荐标签符合毛利规则": (pct(sum(1 for r in ok_rows if r.get("rec_margin_ok")), len(ok_rows)), "100%"),
         "不可行需求识别率": (pct(sum(1 for r in exp_infeasible if r["status"] != "ok"), len(exp_infeasible)), "≥ 90%"),
         "可行需求误判为不可行": (str(sum(1 for r in exp_feasible if r["status"] != "ok")), "0"),
         "整箱礼盒优先率（非组装请求）": (pct(sum(1 for r in box_cases if r["status"] == "ok" and r["all_boxes"]), len(box_cases)), "100%"),
@@ -142,10 +156,11 @@ def write_md(rows: list[dict], summary: dict, wall: float, workers: int) -> None
               "- AI 原始方案预算符合率：选礼盒 Agent 给出的标准款（程序兜底替换 / 组装用量微调之前）落在预算区间的比例。",
               "- 整箱礼盒优先率：期望可行、且不是组装请求的用例中，三档全部是整箱礼盒的比例。",
               "- 场景档次 / 包装偏好匹配率：看标准款主礼盒（价格最高的一款）的 grade / packaging_style 是否与用例期望一致。",
-              "- 临期商品占比：方案金额中剩余保鲜 ≤ 5 天的商品所占比例。", "",
+              "- 临期商品占比：方案金额中剩余保鲜 ≤ 5 天的商品所占比例。",
+              "- 推荐标签符合毛利规则：推荐档毛利率 ≥ 20%；若三档都低于 20%，推荐的是毛利率最高的一档。", "",
               "## 每条用例明细", "",
-              "| 用例 | 需求 | 期望 | 结果 | 解析（份数/预算/场合） | 标准款单价 | AI原始 | 预算符合 | 三档单价（经济/标准/高档） | 标准款档次/包装 | 最低毛利 | 忌讳违规 | 选礼盒次数 | 模型调用 | 耗时 | 成本 |",
-              "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+              "| 用例 | 需求 | 期望 | 结果 | 解析（份数/预算/场合） | 标准款单价 | AI原始 | 预算符合 | 三档单价（经济/标准/高档） | 标准款档次/包装 | 推荐档 | 最低毛利 | 忌讳违规 | 选礼盒次数 | 模型调用 | 耗时 | 成本 |",
+              "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
     for r in rows:
         p = r["parsed"]
         exp = "可行" if r["expected_feasible"] else "不可行"
@@ -156,9 +171,10 @@ def write_md(rows: list[dict], summary: dict, wall: float, workers: int) -> None
             pr = r["prices"]
             three = " / ".join(f"{pr[t]:.0f}" if t in pr else "—" for t in ("经济", "标准", "高档"))
             cells = [f"{r['std_price']:.2f}" if r["std_price"] else "—", raw, "✅" if r["budget_ok"] else "❌", three,
-                     f"{r['std_grade']}/{r['std_style']}", f"{min(r['margins'].values()) * 100:.0f}%", str(r["taboo_violations"])]
+                     f"{r['std_grade']}/{r['std_style']}", f"{r['rec_tier']}（{r['margins'][r['rec_tier']] * 100:.0f}%）" if r['rec_tier'] else "—",
+                     f"{min(r['margins'].values()) * 100:.0f}%", str(r["taboo_violations"])]
         else:
-            cells = ["—", raw, "—", "—", "—", "—", "—"]
+            cells = ["—", raw, "—", "—", "—", "—", "—", "—"]
         slow = " ⚠" if r["elapsed_s"] > 30 else ""
         lines.append(f"| {r['id']} | {r['request']} | {exp} | {mark} {got} | {p['quantity']} / {p['budget']} / {p['occasion']} | "
                      + " | ".join(cells) + f" | {r['attempts']} | {r['calls']} | {r['elapsed_s']:.1f}s{slow} | ${r['cost_usd']:.4f} |")
